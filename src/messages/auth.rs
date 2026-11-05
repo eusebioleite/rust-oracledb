@@ -47,8 +47,11 @@ use crate::write_buffer::WriteBuffer;
 
 type Aes192CbcDec = cbc::Decryptor<aes::Aes192>;
 type Aes192CbcEnc = cbc::Encryptor<aes::Aes192>;
+type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+type DesCbcEnc = cbc::Encryptor<des::Des>;
 
 struct Pair {
     key: String,
@@ -64,7 +67,12 @@ impl Pair {
 
 fn decrypt_cbc(key: &[u8], encrypted_text: &[u8], plain_text: &mut [u8]) {
     let iv = [0u8; 16];
-    if key.len() == 24 {
+    if key.len() == 16 {
+        Aes128CbcDec::new_from_slices(key, &iv)
+            .unwrap()
+            .decrypt_padded_b2b::<NoPadding>(encrypted_text, plain_text)
+            .unwrap();
+    } else if key.len() == 24 {
         Aes192CbcDec::new_from_slices(key, &iv)
             .unwrap()
             .decrypt_padded_b2b::<NoPadding>(
@@ -82,7 +90,12 @@ fn decrypt_cbc(key: &[u8], encrypted_text: &[u8], plain_text: &mut [u8]) {
 
 fn encrypt_cbc(key: &[u8], plain_text: &[u8], encrypted_text: &mut [u8]) {
     let iv = [0u8; 16];
-    if key.len() == 24 {
+    if key.len() == 16 {
+        Aes128CbcEnc::new_from_slices(key, &iv)
+            .unwrap()
+            .encrypt_padded_b2b::<NoPadding>(plain_text, encrypted_text)
+            .unwrap();
+    } else if key.len() == 24 {
         Aes192CbcEnc::new_from_slices(key, &iv)
             .unwrap()
             .encrypt_padded_b2b::<NoPadding>(plain_text, encrypted_text)
@@ -102,6 +115,34 @@ fn get_derived_key(
     derived_key: &mut [u8],
 ) {
     pbkdf2::pbkdf2_hmac::<sha2::Sha512>(key, salt, iterations, derived_key);
+}
+
+/// Encrypts one or more 8-byte blocks using the legacy single-DES CBC scheme.
+fn encrypt_des_cbc(key: &[u8; 8], data: &[u8]) -> Vec<u8> {
+    let iv = [0u8; 8];
+    let mut output = vec![0u8; data.len()];
+    DesCbcEnc::new_from_slices(key, &iv)
+        .unwrap()
+        .encrypt_padded_b2b::<NoPadding>(data, &mut output)
+        .unwrap();
+    output
+}
+
+/// Computes Oracle's legacy 10G DES password verifier (8 binary bytes).
+fn get_10g_verifier(username: &str, password: &[u8]) -> Vec<u8> {
+    let password = String::from_utf8_lossy(password);
+    let text = format!("{}{}", username, password).to_uppercase();
+    let mut data: Vec<u8> =
+        text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let padding = (8 - data.len() % 8) % 8;
+    data.resize(data.len() + padding, 0);
+
+    let fixed_key = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+    let first_pass = encrypt_des_cbc(&fixed_key, &data);
+    let mut intermediate_key = [0u8; 8];
+    intermediate_key.copy_from_slice(&first_pass[first_pass.len() - 8..]);
+    let second_pass = encrypt_des_cbc(&intermediate_key, &data);
+    second_pass[second_pass.len() - 8..].to_vec()
 }
 
 pub struct AuthMessage {
@@ -176,6 +217,7 @@ impl AuthMessage {
         )
         .unwrap();
         let is_12c = self.verifier_type == constants::VERIFIER_TYPE_12C;
+        let is_10g = self.verifier_type == constants::VERIFIER_TYPE_10G;
         let password_hash = if is_12c {
             let iterations: u32 = self
                 .session_data
@@ -195,6 +237,12 @@ impl AuthMessage {
             hasher.update(password_key);
             hasher.update(verifier_data);
             hasher.finalize()[..32].to_vec()
+        } else if is_10g {
+            let username = client.config().user().unwrap();
+            let verifier = get_10g_verifier(username, &password_bytes);
+            let mut password_hash = vec![0u8; 16];
+            password_hash[..verifier.len()].copy_from_slice(&verifier);
+            password_hash
         } else {
             let mut hasher = sha1::Sha1::new();
             hasher.update(&password_bytes);
@@ -235,7 +283,13 @@ impl AuthMessage {
             combo_key.truncate(24);
             combo_key
         } else {
-            let key_len = if is_12c { 32 } else { 24 };
+            let key_len = if is_12c {
+                32
+            } else if is_10g {
+                16
+            } else {
+                24
+            };
             let mut raw_temp_key = session_key_part_b[..key_len].to_vec();
             raw_temp_key.extend_from_slice(&session_key_part_a[..key_len]);
             let temp_key_str = base16ct::upper::encode_string(&raw_temp_key);
@@ -502,7 +556,8 @@ impl Message for AuthMessage {
             if key == "AUTH_VFR_DATA" {
                 if !matches!(
                     flags,
-                    constants::VERIFIER_TYPE_12C
+                    constants::VERIFIER_TYPE_10G
+                        | constants::VERIFIER_TYPE_12C
                         | constants::VERIFIER_TYPE_11G_1
                         | constants::VERIFIER_TYPE_11G_2
                 ) {
